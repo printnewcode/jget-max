@@ -1,10 +1,8 @@
-"""
-URL configuration for the ``bot`` app.
-"""
-
 from django.urls import path
+
 from . import views
 
 urlpatterns = [
-    path("", views.webhook, name="max_webhook"),  # POST /bot/ receives webhook
+    path("setup-webhook/", views.webhook, name="setup_webhook"),
+    path("webhook/", views.webhook_receiver_view, name="webhook_receiver"),
 ]

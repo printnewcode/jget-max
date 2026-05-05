@@ -1,7 +1,3 @@
-"""
-Django Admin configuration for the bot application.
-"""
-
 from django.contrib import admin
 from django.http import HttpRequest
 
@@ -10,13 +6,6 @@ from .models import Application, BotConfig, BotSession
 
 @admin.register(BotConfig)
 class BotConfigAdmin(admin.ModelAdmin):
-    """
-    Admin view for BotConfig.
-
-    Enforces singleton: hides the "Add" button when a config already exists
-    and prevents deletion.
-    """
-
     fieldsets = (
         (
             "Стартовое приветствие",
@@ -52,8 +41,6 @@ class BotConfigAdmin(admin.ModelAdmin):
 
 @admin.register(BotSession)
 class BotSessionAdmin(admin.ModelAdmin):
-    """Read-only view of active bot sessions."""
-
     list_display = ("user_id", "current_step", "phone", "child_name", "updated_at")
     list_filter = ("current_step",)
     search_fields = ("user_id", "phone", "child_name")
@@ -66,8 +53,6 @@ class BotSessionAdmin(admin.ModelAdmin):
 
 @admin.register(Application)
 class ApplicationAdmin(admin.ModelAdmin):
-    """View and manage submitted applications."""
-
     list_display = ("pk", "user_id", "phone", "child_full_name", "status", "created_at")
     list_filter = ("status", "created_at")
     search_fields = ("user_id", "phone", "child_full_name")
