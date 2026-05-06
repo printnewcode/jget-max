@@ -92,7 +92,6 @@ async def start_handler(bot: Bot, chat_id: int, user_id: int) -> None:
         },
     )
     await send_message(bot, chat_id, config.greeting_text)
-    await send_message(bot, chat_id, config.phone_prompt)
 
 
 async def phone_handler(
