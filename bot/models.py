@@ -1,24 +1,8 @@
-"""
-Database models for the MAX bot application.
-
-Models:
-    BotConfig   — Admin-editable bot texts (singleton pattern).
-    BotSession  — Per-user conversation state (phone, name, step).
-    Application — Final submitted user records exported to XLSX.
-"""
-
 from django.db import models
 from django.core.exceptions import ValidationError
 
 
 class BotConfig(models.Model):
-    """
-    Singleton model storing all admin-editable bot texts.
-
-    Only one instance should ever exist. The Django Admin enforces this
-    by disabling the "Add" button when a record already exists.
-    """
-
     greeting_text = models.TextField(
         verbose_name="Приветственное сообщение",
         default=(
@@ -75,7 +59,6 @@ class BotConfig(models.Model):
         return "Настройки бота"
 
     def clean(self) -> None:
-        """Enforce singleton — only one BotConfig record allowed."""
         if not self.pk and BotConfig.objects.exists():
             raise ValidationError(
                 "Может существовать только одна запись настроек бота."
@@ -87,18 +70,11 @@ class BotConfig(models.Model):
 
     @classmethod
     def get_config(cls) -> "BotConfig":
-        """Return the singleton instance, creating it with defaults if absent."""
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
 
 
 class BotSession(models.Model):
-    """
-    Tracks per-user conversation state between stateless webhook calls.
-
-    The ``current_step`` field drives the finite-state machine in handlers.py.
-    """
-
     STEP_WAITING_PHONE = "waiting_phone"
     STEP_WAITING_NAME = "waiting_name"
     STEP_CONFIRMING = "confirming"
@@ -149,10 +125,6 @@ class BotSession(models.Model):
 
 
 class Application(models.Model):
-    """
-    A finalised user submission stored permanently after confirmation.
-    """
-
     STATUS_SUBMITTED = "submitted"
     STATUS_CHOICES = [
         (STATUS_SUBMITTED, "Отправлена"),

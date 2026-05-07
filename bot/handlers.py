@@ -1,257 +1,354 @@
-"""
-Business logic for the MAX messenger bot.
-
-All functions are async and can be called from the webhook view.
-The module uses the maxapi ``Bot`` and ``Dispatcher`` utilities.
-"""
-
-import asyncio
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
 
-from maxapi import Bot, Dispatcher, types
-# from maxapi.types import InlineKeyboardButton, InlineKeyboardMarkup
-
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.utils import timezone
+from maxapi import Bot, Dispatcher, types
+from maxapi.types.attachments.buttons import CallbackButton
+from maxapi.types.input_media import InputMedia
+from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 
-from .models import BotConfig, BotSession, Application
+from bot import dp
+from .models import Application, BotConfig, BotSession
 
 logger = logging.getLogger("bot")
 
-# ---------------------------------------------------------------------------
-# Helper utilities
-# ---------------------------------------------------------------------------
-
 PHONE_REGEX = re.compile(r"^\+7\d{10}$")
+_handlers_registered = False
+DUPLICATE_ADD_CHILD_PAYLOAD = "duplicate_add_child"
+DUPLICATE_EXIT_PAYLOAD = "duplicate_exit"
 
 
 def get_keyboard(edit_phone: bool = False, edit_name: bool = False):
-    """Build the confirmation inline keyboard.
+    builder = InlineKeyboardBuilder()
+    edit_buttons = []
 
-    Parameters
-    ----------
-    edit_phone, edit_name:
-        Flags that indicate whether the corresponding edit button should be
-        be displayed. In the normal flow both are shown, but after a single
-        edit we hide the button that has just been edited so the user can
-        continue without redundant options.
-    """
-    buttons = []
-    row = []
-    
     if edit_phone:
-        row.append({
-            "text": "✏️ Редактировать телефон",
-            "callback_data": "edit_phone",
-        })
+        edit_buttons.append(
+            CallbackButton(text="Изменить телефон", payload="edit_phone")
+        )
     if edit_name:
-        row.append({
-            "text": "✏️ Редактировать ФИО",
-            "callback_data": "edit_name",
-        })
-    
-    if row:
-        buttons.append(row)
+        edit_buttons.append(CallbackButton(text="Изменить ФИО", payload="edit_name"))
 
-    # Кнопка подтверждения
-    buttons.append([
-        {
-            "text": "✅ Подтвердить и отправить",
-            "callback_data": "confirm",
-        }
-    ])
-    
-    return {"inline_keyboard": buttons}
+    if edit_buttons:
+        builder.row(*edit_buttons)
+
+    builder.row(CallbackButton(text="Подтвердить и отправить", payload="confirm"))
+    return builder.as_markup()
 
 
-async def send_message(bot: Bot, chat_id: int, text: str, *, reply_markup = None) -> None:
-    """Thin wrapper that logs and executes ``Bot.send_message`` asynchronously."""
+def get_duplicate_phone_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        CallbackButton(
+            text="Да, добавить ребенка",
+            payload=DUPLICATE_ADD_CHILD_PAYLOAD,
+        )
+    )
+    builder.row(
+        CallbackButton(
+            text="Нет, выйти",
+            payload=DUPLICATE_EXIT_PAYLOAD,
+        )
+    )
+    return builder.as_markup()
+
+
+async def send_message(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    *,
+    attachments=None,
+) -> None:
     logger.debug("Sending message to %s: %s", chat_id, text)
-    await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    await bot.send_message(chat_id=chat_id, text=text, attachments=attachments)
 
 
-# ---------------------------------------------------------------------------
-# Core conversation handlers – pure async functions, no Django request needed
-# ---------------------------------------------------------------------------
+async def get_config() -> BotConfig:
+    return await sync_to_async(BotConfig.get_config)()
+
+
+async def get_session(user_id: int) -> BotSession | None:
+    return await sync_to_async(
+        lambda: BotSession.objects.filter(user_id=user_id).first()
+    )()
+
+
+async def phone_exists(phone: str) -> bool:
+    return await sync_to_async(lambda: Application.objects.filter(phone=phone).exists())()
+
 
 async def start_handler(bot: Bot, chat_id: int, user_id: int) -> None:
-    """Entry point – called when a new chat starts or /start is received.
-
-    It creates (or resets) a BotSession for the user and sends the greeting
-    defined in ``BotConfig``.
-    """
-    config = BotConfig.get_config()
-    # Upsert BotSession – ensure a fresh state for each start
-    session, _ = BotSession.objects.update_or_create(
+    config = await get_config()
+    await sync_to_async(BotSession.objects.update_or_create)(
         user_id=user_id,
-        defaults={"current_step": BotSession.STEP_WAITING_PHONE, "phone": "", "child_name": ""},
+        defaults={
+            "current_step": BotSession.STEP_WAITING_PHONE,
+            "phone": "",
+            "child_name": "",
+        },
     )
     await send_message(bot, chat_id, config.greeting_text)
-    await send_message(bot, chat_id, config.phone_prompt)
 
 
-async def phone_handler(bot: Bot, chat_id: int, user_id: int, message_text: str) -> None:
-    """Validate phone number, store it, and ask for child's name."""
-    config = BotConfig.get_config()
-    if not PHONE_REGEX.match(message_text.strip()):
+async def phone_handler(
+    bot: Bot, chat_id: int, user_id: int, message_text: str
+) -> None:
+    config = await get_config()
+    phone = message_text.strip()
+    if not PHONE_REGEX.match(phone):
         await send_message(bot, chat_id, config.phone_error)
         return
-    BotSession.objects.filter(user_id=user_id).update(
-        phone=message_text.strip(), current_step=BotSession.STEP_WAITING_NAME
-    )
+
+    if await phone_exists(phone):
+        await sync_to_async(
+            lambda: BotSession.objects.filter(user_id=user_id).update(phone=phone)
+        )()
+        await send_message(
+            bot,
+            chat_id,
+            (
+                "Этот номер телефона уже есть в базе.\n\n"
+                "Хотите добавить еще одного ребенка на этот же номер?"
+            ),
+            attachments=[get_duplicate_phone_keyboard()],
+        )
+        return
+
+    await sync_to_async(
+        lambda: BotSession.objects.filter(user_id=user_id).update(
+            phone=phone,
+            current_step=BotSession.STEP_WAITING_NAME,
+        )
+    )()
     await send_message(bot, chat_id, config.name_prompt)
 
 
-async def name_handler(bot: Bot, chat_id: int, user_id: int, message_text: str) -> None:
-    """Store child's full name and present the confirmation screen."""
-    config = BotConfig.get_config()
-    BotSession.objects.filter(user_id=user_id).update(
-        child_name=message_text.strip(), current_step=BotSession.STEP_CONFIRMING
+async def name_handler(
+    bot: Bot, chat_id: int, user_id: int, message_text: str
+) -> None:
+    config = await get_config()
+    await sync_to_async(
+        lambda: BotSession.objects.filter(user_id=user_id).update(
+            child_name=message_text.strip(),
+            current_step=BotSession.STEP_CONFIRMING,
+        )
+    )()
+    session = await sync_to_async(BotSession.objects.get)(user_id=user_id)
+    summary = config.confirmation_template.format(
+        phone=session.phone,
+        name=session.child_name,
     )
-    session = BotSession.objects.get(user_id=user_id)
-    summary = config.confirmation_template.format(phone=session.phone, name=session.child_name)
-    keyboard = get_keyboard(edit_phone=True, edit_name=True)
-    await send_message(bot, chat_id, summary, reply_markup=keyboard)
+    await send_message(
+        bot,
+        chat_id,
+        summary,
+        attachments=[get_keyboard(edit_phone=True, edit_name=True)],
+    )
 
 
 async def edit_phone_handler(bot: Bot, chat_id: int, user_id: int) -> None:
-    """Prompt user to re‑enter phone number (editing flow)."""
-    config = BotConfig.get_config()
-    BotSession.objects.filter(user_id=user_id).update(current_step=BotSession.STEP_EDITING_PHONE)
+    config = await get_config()
+    await sync_to_async(
+        lambda: BotSession.objects.filter(user_id=user_id).update(
+            current_step=BotSession.STEP_EDITING_PHONE
+        )
+    )()
     await send_message(bot, chat_id, config.edit_phone_prompt)
 
 
 async def edit_name_handler(bot: Bot, chat_id: int, user_id: int) -> None:
-    """Prompt user to re‑enter child's full name (editing flow)."""
-    config = BotConfig.get_config()
-    BotSession.objects.filter(user_id=user_id).update(current_step=BotSession.STEP_EDITING_NAME)
+    config = await get_config()
+    await sync_to_async(
+        lambda: BotSession.objects.filter(user_id=user_id).update(
+            current_step=BotSession.STEP_EDITING_NAME
+        )
+    )()
     await send_message(bot, chat_id, config.edit_name_prompt)
 
 
 async def confirm_handler(bot: Bot, chat_id: int, user_id: int) -> None:
-    """Finalize the submission, save to ``Application`` and clear the session."""
-    config = BotConfig.get_config()
-    session = BotSession.objects.get(user_id=user_id)
-    # Persist final record
-    Application.objects.create(
+    config = await get_config()
+    session = await sync_to_async(BotSession.objects.get)(user_id=user_id)
+    await sync_to_async(Application.objects.create)(
         user_id=user_id,
         phone=session.phone,
         child_full_name=session.child_name,
         status=Application.STATUS_SUBMITTED,
         created_at=timezone.now(),
     )
-    # Clear the session (so a new start begins fresh)
-    BotSession.objects.filter(user_id=user_id).delete()
+    await sync_to_async(lambda: BotSession.objects.filter(user_id=user_id).delete())()
     await send_message(bot, chat_id, config.completion_text)
 
 
-# ---------------------------------------------------------------------------
-# Inline button dispatcher – called from webhook when ``callback_query`` arrives
-# ---------------------------------------------------------------------------
+async def duplicate_add_child_handler(bot: Bot, chat_id: int, user_id: int) -> None:
+    config = await get_config()
+    await sync_to_async(
+        lambda: BotSession.objects.filter(user_id=user_id).update(
+            current_step=BotSession.STEP_WAITING_NAME,
+            child_name="",
+        )
+    )()
+    await send_message(bot, chat_id, config.name_prompt)
 
-async def callback_query_handler(bot: Bot, chat_id: int, user_id: int, data: str) -> None:
-    if data == "edit_phone":
+
+async def duplicate_exit_handler(bot: Bot, chat_id: int, user_id: int) -> None:
+    await sync_to_async(lambda: BotSession.objects.filter(user_id=user_id).delete())()
+    await send_message(
+        bot,
+        chat_id,
+        "Хорошо, заявку не добавляю. Чтобы начать заново, отправьте /start.",
+    )
+
+
+async def callback_query_handler(
+    bot: Bot, chat_id: int, user_id: int, payload: str | None
+) -> None:
+    if payload == "edit_phone":
         await edit_phone_handler(bot, chat_id, user_id)
-    elif data == "edit_name":
+    elif payload == "edit_name":
         await edit_name_handler(bot, chat_id, user_id)
-    elif data == "confirm":
+    elif payload == "confirm":
         await confirm_handler(bot, chat_id, user_id)
+    elif payload == DUPLICATE_ADD_CHILD_PAYLOAD:
+        await duplicate_add_child_handler(bot, chat_id, user_id)
+    elif payload == DUPLICATE_EXIT_PAYLOAD:
+        await duplicate_exit_handler(bot, chat_id, user_id)
     else:
-        logger.warning("Unknown callback data received: %s", data)
+        logger.warning("Unknown callback payload received: %s", payload)
 
-
-# ---------------------------------------------------------------------------
-# Export command – only admin can trigger via a private chat
-# ---------------------------------------------------------------------------
 
 async def export_handler(bot: Bot, chat_id: int, user_id: int) -> None:
-    """Export all applications to an XLSX file and send it to the admin.
-
-    Only the user whose ``user_id`` matches ``settings.MAX_ADMIN_ID`` may
-    invoke this function.
-    """
     if user_id != settings.MAX_ADMIN_ID:
         logger.warning("Unauthorized export attempt by %s", user_id)
         return
+
+    await send_message(bot, chat_id, "Формирую файл с заявками...")
+
     import pandas as pd
 
-    qs = Application.objects.all().values(
-        "pk",
-        "user_id",
-        "phone",
-        "child_full_name",
-        "status",
-        "created_at",
-    )
-    df = pd.DataFrame.from_records(qs)
+    rows = await sync_to_async(
+        lambda: list(
+            Application.objects.all().values(
+                "phone",
+                "child_full_name",
+            )
+        )
+    )()
+    df = pd.DataFrame.from_records(rows)
     if df.empty:
-        await send_message(bot, chat_id, "⚠ Нет заявок для экспорта.")
+        await send_message(bot, chat_id, "Нет заявок для экспорта.")
         return
-    # Convert datetime to string for Excel friendliness
-    df["created_at"] = df["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    file_path = settings.BASE_DIR / f"applications_{timezone.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    df.to_excel(file_path, index=False, engine="openpyxl")
-    with open(file_path, "rb") as f:
-        await bot.send_document(chat_id=chat_id, document=f, caption="📊 Экспорт заявок")
-    # Clean up the temporary file
-    file_path.unlink(missing_ok=True)
+
+    df = df.rename(
+        columns={
+            "child_full_name": "ФИО ребенка",
+            "phone": "Телефон",
+        }
+    )[["ФИО ребенка", "Телефон"]]
+    file_path: Path = (
+        settings.BASE_DIR
+        / f"applications_{timezone.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    )
+    await sync_to_async(df.to_excel)(file_path, index=False, engine="openpyxl")
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Экспорт заявок",
+            attachments=[InputMedia(str(file_path))],
+        )
+    finally:
+        file_path.unlink(missing_ok=True)
+
     logger.info("Exported %d applications for admin %s", df.shape[0], user_id)
 
 
-# ---------------------------------------------------------------------------
-# Dispatcher configuration – ties together the above handlers
-# ---------------------------------------------------------------------------
+def _message_text(event: types.MessageCreated) -> str:
+    body = event.message.body
+    return body.text if body and body.text else ""
+
+
+def _message_chat_id(event: types.MessageCreated) -> int | None:
+    return event.message.recipient.chat_id
+
+
+def _message_user_id(event: types.MessageCreated) -> int | None:
+    return event.message.sender.user_id if event.message.sender else None
+
 
 def get_dispatcher() -> Dispatcher:
-    bot = Bot(token=settings.MAX_BOT_TOKEN)
-    dp = Dispatcher()
-    dp.bot = bot # Привязываем бота к диспетчеру
+    global _handlers_registered
 
-    # Команда /start
+    if _handlers_registered:
+        return dp
+
+    @dp.bot_started()
+    async def _(event: types.BotStarted):
+        await start_handler(dp.bot, event.chat_id, event.user.user_id)
+
     @dp.message_created(types.Command("start"))
     async def _(event: types.MessageCreated):
-        await start_handler(dp.bot, event.message.chat_id, event.message.from_user.id)
+        chat_id = _message_chat_id(event)
+        user_id = _message_user_id(event)
+        if chat_id is None or user_id is None:
+            logger.warning("Cannot handle /start without chat_id or user_id")
+            return
+        await start_handler(dp.bot, chat_id, user_id)
 
-    # Команда /export
     @dp.message_created(types.Command("export"))
     async def _(event: types.MessageCreated):
-        await export_handler(dp.bot, event.message.chat_id, event.message.from_user.id)
+        chat_id = _message_chat_id(event)
+        user_id = _message_user_id(event)
+        if chat_id is None or user_id is None:
+            logger.warning("Cannot handle /export without chat_id or user_id")
+            return
+        await export_handler(dp.bot, chat_id, user_id)
 
-    # Обычные сообщения (обработка шагов регистрации)
     @dp.message_created()
     async def _(event: types.MessageCreated):
-        if event.message.text.startswith("/"):
+        text = _message_text(event)
+        if text.startswith("/"):
             return
 
-        user_id = event.message.from_user.id
-        session = BotSession.objects.filter(user_id=user_id).first()
+        chat_id = _message_chat_id(event)
+        user_id = _message_user_id(event)
+        if chat_id is None or user_id is None:
+            logger.warning("Cannot handle message without chat_id or user_id")
+            return
+
+        session = await get_session(user_id)
         if not session:
             return
-
-        chat_id = event.message.chat_id
-        text = event.message.text
 
         if session.current_step == BotSession.STEP_WAITING_PHONE:
             await phone_handler(dp.bot, chat_id, user_id, text)
         elif session.current_step == BotSession.STEP_WAITING_NAME:
             await name_handler(dp.bot, chat_id, user_id, text)
-        elif session.current_step in (BotSession.STEP_EDITING_PHONE, BotSession.STEP_EDITING_NAME):
-            if session.current_step == BotSession.STEP_EDITING_PHONE:
-                await phone_handler(dp.bot, chat_id, user_id, text)
-            else:
-                await name_handler(dp.bot, chat_id, user_id, text)
+        elif session.current_step == BotSession.STEP_EDITING_PHONE:
+            await phone_handler(dp.bot, chat_id, user_id, text)
+        elif session.current_step == BotSession.STEP_EDITING_NAME:
+            await name_handler(dp.bot, chat_id, user_id, text)
 
-    # ОБРАБОТКА КНОПОК (измените на message_callback)
     @dp.message_callback()
     async def _(event: types.MessageCallback):
-        # В этой библиотеке данные кнопки обычно в event.callback_data или event.data
+        if event.message is None:
+            logger.warning("Cannot handle callback without source message")
+            return
+
+        chat_id = event.message.recipient.chat_id
+        if chat_id is None:
+            logger.warning("Cannot handle callback without chat_id")
+            return
+
         await callback_query_handler(
-            dp.bot, 
-            event.message.chat_id, 
-            event.from_user.id, 
-            event.data # Проверьте это поле в дебаге, если не сработает
+            dp.bot,
+            chat_id,
+            event.callback.user.user_id,
+            event.callback.payload,
         )
 
+    _handlers_registered = True
     return dp
