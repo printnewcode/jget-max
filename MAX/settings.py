@@ -26,6 +26,7 @@ SECRET_KEY = os.environ.get(
 )
 
 DEBUG = os.environ.get("DEBUG", "False").lower() in ("1", "true", "yes")
+LOCAL = os.environ.get("LOCAL", "False").lower() in ("1", "true", "yes")
 
 ALLOWED_HOSTS: list[str] = [
     h.strip()
@@ -79,12 +80,23 @@ ASGI_APPLICATION = "MAX.asgi.application"
 # ---------------------------------------------------------------------------
 # Database — SQLite (single-file, no extra setup needed on Beget)
 # ---------------------------------------------------------------------------
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+if LOCAL:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.mysql",
+            "NAME": os.getenv("NAME_DB"),
+            "USER": os.getenv("NAME_DB"),
+            "PASSWORD": os.getenv("PASS_DB"),
+            "HOST": "127.0.0.1",
+        }
+    }
 
 # ---------------------------------------------------------------------------
 # Password validation
